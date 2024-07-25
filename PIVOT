@@ -1,0 +1,147 @@
+/*
+
+Allows to pivot a table into a new temp table based on custom syntax. This procedure is scalable based on this custom syntax
+Be mindful of your database VARCHAR/TEXT limitations. If the cluster you are using has capped datatypes, this procedure may fail.
+
+Custom syntax follows this pattern:
+** - marks custom variables to be put in
+'table *name for a TEMP TABLE which will contain the result (table is created via this procedure)* from *source table containing the data to pivot* row *group by column* col *column to be split into multiple columns* val *column which will populate the newly create data structure
+
+Example below the procedure
+
+*/
+
+create procedure pivot(input_string character varying)
+    language plpgsql
+as
+$$
+DECLARE
+    target_table VARCHAR;
+    source_table VARCHAR;
+    id_col VARCHAR;
+    col_col VARCHAR;
+    val_col VARCHAR;
+    sql_text_start TEXT := '';
+    sql_text_maxcase TEXT := '';
+    sql_text_end TEXT := '';
+    sql_dropifexists VARCHAR;
+    rec RECORD;
+    word TEXT;
+    next_word TEXT;
+    iter INTEGER := 1;
+    words_count INTEGER;
+BEGIN
+    -- Count the number of spaces (hence, words - 1) in the input string
+    words_count := length(input_string) - length(replace(input_string, ' ', '')) + 1;
+
+    WHILE iter <= words_count LOOP
+        -- Extract the current and next word from the input_string
+        word := split_part(input_string, ' ', iter);
+        next_word := split_part(input_string, ' ', iter + 1);
+
+        IF word = 'table' THEN
+            target_table := next_word;
+        ELSIF word = 'from' THEN
+            source_table := next_word;
+        ELSIF word = 'row' THEN
+            id_col := next_word;
+        ELSIF word = 'col' THEN
+            col_col := next_word;
+        ELSIF word = 'val' THEN
+            val_col := next_word;
+        END IF;
+
+        iter := iter + 2; -- Increment by 2 to skip the next word already processed
+    END LOOP;
+
+    IF target_table IS NULL OR source_table IS NULL OR id_col IS NULL OR col_col IS NULL OR val_col IS NULL THEN
+        RAISE NOTICE 'Missing required information: table, from, row, col, or val';
+        RETURN;
+    ELSE
+        sql_dropifexists := 'DROP TABLE IF EXISTS ' || target_table;
+        EXECUTE sql_dropifexists;
+
+        sql_text_start := 'CREATE TEMP TABLE ' || quote_ident(target_table) || ' AS (SELECT ' || quote_ident(id_col);
+
+        FOR rec IN EXECUTE 'SELECT DISTINCT ' || quote_ident(col_col) || ' AS col FROM ' || quote_ident(source_table)
+        LOOP
+            sql_text_maxcase := sql_text_maxcase || ', MAX(CASE WHEN ' || quote_ident(col_col) || ' = ''' || rec.col || ''' THEN ' || quote_ident(val_col) || ' END) AS ' || quote_ident(rec.col);
+        END LOOP;
+
+        sql_text_end := sql_text_end || ' FROM ' || quote_ident(source_table) || ' GROUP BY ' || quote_ident(id_col) || ');';
+
+        EXECUTE (sql_text_start || sql_text_maxcase || sql_text_end);
+    END IF;
+END;
+$$;
+
+/*
+
+Example:
+
+Given a table like:
+id	category	amount
+1	A	10
+1	B	20
+1	C	30
+
+Procedure first drops the result table based on the name ('table *THIS NAME* from...')
+
+DROP TABLE IF EXISTS pivoted_table;
+
+SELECT DISTINCT category AS col FROM source_table --Find new column names
+
+Then some SQL is generated like so:
+
+CREATE TEMP TABLE pivoted_table AS (
+    SELECT id, -- This is the 'row' value
+           MAX(CASE WHEN category = 'A' THEN amount END) AS A, --For each value in the 'col' column, a new column will be generated 
+           MAX(CASE WHEN category = 'B' THEN amount END) AS B,
+           MAX(CASE WHEN category = 'C' THEN amount END) AS C
+    FROM source_table
+    GROUP BY id
+
+This procedure results in these actions on the table:
+
+id	category	amount
+1	A	10
+1	B	20
+1	C	30
+
+SELECT DISTINCT category AS col FROM source_table;
+category
+A
+B
+C
+
+CASE WHEN category = * THEN amount END AS *
+This results in this diagonal structure
+id A	B C
+1	10 * *
+1	*	20 *
+1	* *	30
+
+MAX(*previous SQL*)
+GROUP BY id
+This snaps the previous step into a single row for each unique id, essentially pivoting the table.
+id A B C
+1 10 20 30
+
+This pattern can be used to pivot any table if used correctly:
+SELECT
+  group_id_column,
+  MAX(CASE WHEN split_column = 'value1' THEN value_column END) AS value1,
+  MAX(CASE WHEN split_column = 'value2' THEN value_column END) AS value2,
+  MAX(CASE WHEN split_column = 'value3' THEN value_column END) AS value3,
+  [...]
+FROM source_table
+GROUP BY group_id_column
+*/
+
+/*FAQ
+
+Q: Why even use this? You can use PIVOT() instead.
+A: PIVOT() and UNPIVOT functions are not a guarantee when using several SQL dialects, but MAX and CASE are available in most, making this method viable.
+
+That's a Redshift workaround :D
+*/
